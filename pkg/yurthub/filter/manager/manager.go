@@ -82,7 +82,7 @@ func NewFilterManager(options *yurtoptions.YurtHubOptions,
 		initializerChain = append(initializerChain, genericInitializer, nodesInitializer)
 
 		// 4. initialize all object filters
-		newNameToFilters, err = base.NewFromFilters(initializerChain)
+		nameToFilters, err = filters.NewFromFilters(initializerChain)
 		if err != nil {
 			return nil, err
 		}
@@ -211,7 +211,7 @@ func (m *Manager) Reset(cmData map[string]string) error {
 
 		// Initialize all object filters with the new chain.
 		var err error
-		newNameToFilters, err = filters.NewFromFilters(initializerChain)
+		newNameToFilters, err = filtersReg.NewFromFilters(initializerChain)
 		if err != nil {
 			klog.Errorf("could not rebuild filters during Reset, %v", err)
 			return err
