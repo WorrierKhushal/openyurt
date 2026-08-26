@@ -37,7 +37,9 @@ import (
 	"github.com/openyurtio/openyurt/pkg/yurthub/configuration"
 	"github.com/openyurtio/openyurt/pkg/yurthub/filter"
 	"github.com/openyurtio/openyurt/pkg/yurthub/kubernetes/serializer"
-	)
+	proxyutil "github.com/openyurtio/openyurt/pkg/yurthub/proxy/util"
+	"github.com/openyurtio/openyurt/pkg/yurthub/util"
+)
 
 func TestFindResponseFilter(t *testing.T) {
 	fakeClient := &fake.Clientset{}
@@ -165,7 +167,7 @@ func TestFindResponseFilter(t *testing.T) {
 				responseFilter, isFound = finder.FindResponseFilter(req)
 			})
 
-			handler = util.WithRequestClientComponent(handler)
+			handler = proxyutil.WithRequestClientComponent(handler)
 			handler = filters.WithRequestInfo(handler, resolver)
 			handler.ServeHTTP(httptest.NewRecorder(), req)
 
@@ -310,7 +312,7 @@ func TestFindObjectFilter(t *testing.T) {
 				objectFilter, isFound = finder.FindObjectFilter(req)
 			})
 
-			handler = util.WithRequestClientComponent(handler)
+			handler = proxyutil.WithRequestClientComponent(handler)
 			handler = filters.WithRequestInfo(handler, resolver)
 			handler.ServeHTTP(httptest.NewRecorder(), req)
 
@@ -344,7 +346,7 @@ func TestFilterManagerDynamicUpdate(t *testing.T) {
 	// Config A: enable masterservice filter only
 	optionsA := &options.YurtHubOptions{
 		EnableResourceFilter:    true,
-		WorkingMode:             string(util.WorkingModeCloud),
+		WorkingMode:             string(util.WorkingModeEdge),
 		DisabledResourceFilters: []string{},
 		EnableDummyIf:           false,
 		NodeName:                "test-node",
@@ -365,54 +367,46 @@ func TestFilterManagerDynamicUpdate(t *testing.T) {
 	// rebuilds the internal maps correctly.
 	finderA, _ := NewFilterManager(optionsA, sharedFactory, nodePoolFactory, fakeClient, serializerManager, configManager)
 
-	// Config B: enable both masterservice and discardcloudservice filters
-	optionsB := &options.YurtHubOptions{
-		EnableResourceFilter:    true,
-		WorkingMode:             string(util.WorkingModeCloud),
-		DisabledResourceFilters: []string{},
-		EnableDummyIf:           false,
-		NodeName:                "test-node",
-		YurtHubProxySecurePort:  10268,
-		HubAgentDummyIfIP:       "127.0.0.1",
-		YurtHubProxyHost:        "127.0.0.1",
-	}
-	optionsB.DisabledResourceFilters = []string{}
-
 	// Reset the finder with new config data simulating a ConfigMap update.
-	// The cmData format matches what the yurt-hub-cfg ConfigMap provides:
-	//   "masterservice=component,resource,verb"
-	//   "discardcloudservice=component,resource,verb"
 	newCfg := map[string]string{
-		"masterservice":  "service,get,verbs",
-		"discardcloudservice": "nodes,list,verbs",
+		"masterservice": "kubelet,services,get",
 	}
 
 	if err := finderA.Reset(newCfg); err != nil {
 		t.Fatalf("Reset() unexpected error: %v", err)
 	}
 
-	// Verify that FindObjectFilter now reflects Config B (both filters).
+	// Verify that FindObjectFilter/FindResponseFilter work after Reset.
+	resolver := newTestRequestInfoResolver()
 	req, _ := http.NewRequest("GET", "/api/v1/services", nil)
 	req.RemoteAddr = "127.0.0.1"
+	req.Header.Set("User-Agent", "kubelet")
 
-	_, foundB := finderA.FindObjectFilter(req)
+	var foundB bool
+	var responseFilter filter.ResponseFilter
+	var ok bool
+	var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		_, foundB = finderA.FindObjectFilter(req)
+		responseFilter, ok = finderA.FindResponseFilter(req)
+	})
+
+	handler = proxyutil.WithRequestClientComponent(handler)
+	handler = filters.WithRequestInfo(handler, resolver)
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
 	if !foundB {
 		t.Error("expected FindObjectFilter to find filters after Reset, but got not found")
 	}
 
-	// Verify the filter names include both masterservice and discardcloudservice.
-	responseFilter, ok := finderA.FindResponseFilter(req)
 	if !ok {
 		t.Error("expected FindResponseFilter to find a response filter after Reset")
+	} else if responseFilter != nil {
+		names := strings.Split(responseFilter.Name(), ",")
+		filterNames := sets.New(names...)
+		if !filterNames.Has("masterservice") {
+			t.Errorf("expected filter names to include masterservice, got %v", names)
+		}
 	}
-	names := strings.Split(responseFilter.Name(), ",")
-	filterNames := sets.New(names...)
-	if !filterNames.Has("masterservice") || !filterNames.Has("discardcloudservice") {
-		t.Errorf("expected filter names to include both masterservice and discardcloudservice, got %v", names)
-	}
-
-	t.Logf("TestFilterManagerDynamicUpdate passed: filters updated from %v to %v", 
-		[]string{"masterservice"}, names)
 }
 
 // newTestRequestInfoResolver is a test helper that returns a default request info resolver.

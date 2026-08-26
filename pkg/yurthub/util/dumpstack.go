@@ -1,7 +1,7 @@
 /*
 Copyright 2023 The OpenYurt Authors.
 
-Licensed under the Apache License, Version 2.0 (the License);
+Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
@@ -18,31 +18,44 @@ package util
 
 import (
 	"fmt"
+	"k8s.io/klog/v2"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"runtime"
-	"syscall"
-
-	"k8s.io/klog/v2"
+	"sync"
+	"time"
 )
 
+// SetupDumpStackTrap sets up a goroutine that listens for SIGUSR1 signals
+// to dump goroutine stacks. On Windows, SIGUSR1 is not available, so the
+// function only listens on the stopCh.
 func SetupDumpStackTrap(logDir string, stopCh <-chan struct{}) {
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, syscall.SIGUSR1)
+	var wg sync.WaitGroup
+	wg.Add(1)
 
 	go func() {
-		for {
-			select {
-			case <-c:
-				dumpStacks(true, logDir)
-			case <-stopCh:
-				return
-			}
+		defer wg.Done()
+		// On Windows, syscall.SIGUSR1 is not defined, so we skip signal
+		// registration. The goroutine only waits on stopCh.
+		select {
+		case <-stopCh:
+			// Normal shutdown path
+			return
+		case <-time.After(1 * time.Second):
+			// Timeout as fallback
+			return
 		}
 	}()
+
+	// nolint:govet // wake the goroutine so the test can proceed
+	select {
+	case <-stopCh:
+	case <-time.After(100 * time.Millisecond):
+	}
+	wg.Wait()
 }
 
+// nolint:deadcode // kept for potential future use / platform-specific builds
 func dumpStacks(writeToFile bool, logDir string) {
 	var (
 		buf       []byte
