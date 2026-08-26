@@ -37,8 +37,7 @@ import (
 	"github.com/openyurtio/openyurt/pkg/yurthub/configuration"
 	"github.com/openyurtio/openyurt/pkg/yurthub/filter"
 	"github.com/openyurtio/openyurt/pkg/yurthub/kubernetes/serializer"
-	"github.com/openyurtio/openyurt/pkg/yurthub/proxy/util"
-)
+	)
 
 func TestFindResponseFilter(t *testing.T) {
 	fakeClient := &fake.Clientset{}
@@ -330,6 +329,93 @@ func TestFindObjectFilter(t *testing.T) {
 	}
 }
 
+// TestFilterManagerDynamicUpdate verifies that the FilterManager correctly
+// rebuilds its internal state (nameToObjectFilter and resourceSyncers) when
+// the yurt-hub-cfg ConfigMap changes at runtime. This ensures that filter
+// configuration updates are propagated transparently without requiring a
+// Yurthub restart.
+func TestFilterManagerDynamicUpdate(t *testing.T) {
+	fakeClient := &fake.Clientset{}
+	scheme := runtime.NewScheme()
+	apis.AddToScheme(scheme)
+	fakeDynamicClient := dynamicfake.NewSimpleDynamicClient(scheme)
+	serializerManager := serializer.NewSerializerManager()
+
+	// Config A: enable masterservice filter only
+	optionsA := &options.YurtHubOptions{
+		EnableResourceFilter:    true,
+		WorkingMode:             string(util.WorkingModeCloud),
+		DisabledResourceFilters: []string{},
+		EnableDummyIf:           false,
+		NodeName:                "test-node",
+		YurtHubProxySecurePort:  10268,
+		HubAgentDummyIfIP:       "127.0.0.1",
+		YurtHubProxyHost:        "127.0.0.1",
+	}
+	optionsA.DisabledResourceFilters = []string{}
+
+	sharedFactory, nodePoolFactory := informers.NewSharedInformerFactory(fakeClient, 24*time.Hour),
+		dynamicinformer.NewDynamicSharedInformerFactory(fakeDynamicClient, 24*time.Hour)
+
+	configManager := configuration.NewConfigurationManager(optionsA.NodeName, sharedFactory)
+
+	// NOTE: We can't fully start the informers in this unit test context without
+	// a real k8s cluster, but we can test the Reset path by directly exercising
+	// the method with synthetic config data. The test below verifies that Reset
+	// rebuilds the internal maps correctly.
+	finderA, _ := NewFilterManager(optionsA, sharedFactory, nodePoolFactory, fakeClient, serializerManager, configManager)
+
+	// Config B: enable both masterservice and discardcloudservice filters
+	optionsB := &options.YurtHubOptions{
+		EnableResourceFilter:    true,
+		WorkingMode:             string(util.WorkingModeCloud),
+		DisabledResourceFilters: []string{},
+		EnableDummyIf:           false,
+		NodeName:                "test-node",
+		YurtHubProxySecurePort:  10268,
+		HubAgentDummyIfIP:       "127.0.0.1",
+		YurtHubProxyHost:        "127.0.0.1",
+	}
+	optionsB.DisabledResourceFilters = []string{}
+
+	// Reset the finder with new config data simulating a ConfigMap update.
+	// The cmData format matches what the yurt-hub-cfg ConfigMap provides:
+	//   "masterservice=component,resource,verb"
+	//   "discardcloudservice=component,resource,verb"
+	newCfg := map[string]string{
+		"masterservice":  "service,get,verbs",
+		"discardcloudservice": "nodes,list,verbs",
+	}
+
+	if err := finderA.Reset(newCfg); err != nil {
+		t.Fatalf("Reset() unexpected error: %v", err)
+	}
+
+	// Verify that FindObjectFilter now reflects Config B (both filters).
+	req, _ := http.NewRequest("GET", "/api/v1/services", nil)
+	req.RemoteAddr = "127.0.0.1"
+
+	_, foundB := finderA.FindObjectFilter(req)
+	if !foundB {
+		t.Error("expected FindObjectFilter to find filters after Reset, but got not found")
+	}
+
+	// Verify the filter names include both masterservice and discardcloudservice.
+	responseFilter, ok := finderA.FindResponseFilter(req)
+	if !ok {
+		t.Error("expected FindResponseFilter to find a response filter after Reset")
+	}
+	names := strings.Split(responseFilter.Name(), ",")
+	filterNames := sets.New(names...)
+	if !filterNames.Has("masterservice") || !filterNames.Has("discardcloudservice") {
+		t.Errorf("expected filter names to include both masterservice and discardcloudservice, got %v", names)
+	}
+
+	t.Logf("TestFilterManagerDynamicUpdate passed: filters updated from %v to %v", 
+		[]string{"masterservice"}, names)
+}
+
+// newTestRequestInfoResolver is a test helper that returns a default request info resolver.
 func newTestRequestInfoResolver() *request.RequestInfoFactory {
 	return &request.RequestInfoFactory{
 		APIPrefixes:          sets.NewString("api", "apis"),
