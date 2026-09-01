@@ -24,8 +24,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	"github.com/openyurtio/openyurt/pkg/apis/raven"
 	ravenv1beta1 "github.com/openyurtio/openyurt/pkg/apis/raven/v1beta1"
 	"github.com/openyurtio/openyurt/pkg/yurtmanager/controller/raven/gatewaypickup/config"
 	"github.com/openyurtio/openyurt/pkg/yurtmanager/controller/raven/util"
@@ -540,5 +545,89 @@ func TestReconcileGateway_addExtraAllowedSubnet(t *testing.T) {
 	mockReconciler.addExtraAllowedSubnet(gw)
 	if !reflect.DeepEqual(gw.Status.Nodes, expect.Status.Nodes) {
 		t.Errorf("failed add extra allowed subnet, expect %v, but get %v", expect.Status.Nodes, gw.Status.Nodes)
+	}
+}
+
+func TestGatewayReconcile_StaleEndpointAfterNodeDeletion(t *testing.T) {
+	nodeA := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "gateway-node-A",
+			Labels: map[string]string{
+				raven.LabelCurrentGateway: "gw-1",
+			},
+		},
+		Status: nodeReadyStatus,
+	}
+
+	configMapObj := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      util.RavenGlobalConfig,
+			Namespace: util.WorkingNamespace,
+		},
+		Data: map[string]string{
+			util.RavenEnableProxy:  "true",
+			util.RavenEnableTunnel: "true",
+		},
+	}
+
+	gw := &ravenv1beta1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "gw-1",
+		},
+		Spec: ravenv1beta1.GatewaySpec{
+			ProxyConfig: ravenv1beta1.ProxyConfiguration{
+				Replicas: 1,
+			},
+			TunnelConfig: ravenv1beta1.TunnelConfiguration{
+				Replicas: 1,
+			},
+			Endpoints: []ravenv1beta1.Endpoint{
+				{
+					NodeName: "gateway-node-A",
+					Type:     ravenv1beta1.Tunnel,
+				},
+			},
+		},
+		Status: ravenv1beta1.GatewayStatus{
+			ActiveEndpoints: []*ravenv1beta1.Endpoint{
+				{
+					NodeName: "gateway-node-A",
+					Type:     ravenv1beta1.Tunnel,
+				},
+			},
+		},
+	}
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = ravenv1beta1.AddToScheme(scheme)
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(gw).WithObjects(nodeA, configMapObj, gw).Build()
+	reconciler := &ReconcileGateway{
+		Client:   fakeClient,
+		scheme:   scheme,
+		recorder: record.NewFakeRecorder(100),
+	}
+
+	ctx := context.Background()
+	err := fakeClient.Delete(ctx, nodeA)
+	assert.NoError(t, err)
+
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Name: "gw-1",
+		},
+	}
+
+	res, err := reconciler.Reconcile(ctx, req)
+	assert.NoError(t, err)
+	assert.True(t, res.RequeueAfter > 0)
+
+	var updatedGw ravenv1beta1.Gateway
+	err = fakeClient.Get(ctx, req.NamespacedName, &updatedGw)
+	assert.NoError(t, err)
+
+	for _, ep := range updatedGw.Status.ActiveEndpoints {
+		assert.NotEqual(t, "gateway-node-A", ep.NodeName)
 	}
 }

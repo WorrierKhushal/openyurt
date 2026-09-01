@@ -29,6 +29,7 @@ import (
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -167,12 +168,27 @@ func (r *ReconcileGateway) Reconcile(ctx context.Context, req reconcile.Request)
 		return reconcile.Result{}, err
 	}
 
-	// 1. try to elect an active endpoint if possible
 	activeEp := r.electActiveEndpoint(nodeList, &gw)
+	validActiveEp := make([]*ravenv1beta1.Endpoint, 0, len(activeEp))
+	for _, ep := range activeEp {
+		var n corev1.Node
+		if err := r.Get(ctx, types.NamespacedName{Name: ep.NodeName}, &n); err != nil {
+			if apierrs.IsNotFound(err) {
+				klog.Warning(Format("node %s for active endpoint in gateway %s not found", ep.NodeName, gw.GetName()))
+				continue
+			}
+			klog.Error(Format("unable to get node %s for gateway %s, error %s", ep.NodeName, gw.GetName(), err.Error()))
+			return reconcile.Result{}, err
+		}
+		validActiveEp = append(validActiveEp, ep)
+	}
+	if len(validActiveEp) != len(activeEp) && len(validActiveEp) == 0 {
+		klog.Warning(Format("no valid active endpoint exists for gateway %s", gw.GetName()))
+	}
+	activeEp = validActiveEp
 	r.recordEndpointEvent(&gw, gw.Status.ActiveEndpoints, activeEp)
 	gw.Status.ActiveEndpoints = activeEp
 	r.configEndpoints(ctx, &gw)
-	// 2. get nodeInfo list of nodes managed by the Gateway
 	var nodes []ravenv1beta1.NodeInfo
 	for _, v := range nodeList.Items {
 		podCIDRs, err := r.getPodCIDRs(ctx, v)
@@ -198,7 +214,7 @@ func (r *ReconcileGateway) Reconcile(ctx context.Context, req reconcile.Request)
 		klog.Error(Format("unable to update %s gateway.status, error %s", gw.GetName(), err.Error()))
 		return reconcile.Result{Requeue: true, RequeueAfter: 5 * time.Second}, err
 	}
-	return reconcile.Result{}, nil
+	return reconcile.Result{RequeueAfter: 30 * time.Second}, nil
 }
 
 func (r *ReconcileGateway) recordEndpointEvent(sourceObj *ravenv1beta1.Gateway, previous, current []*ravenv1beta1.Endpoint) {
